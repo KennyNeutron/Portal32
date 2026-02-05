@@ -29,8 +29,11 @@ Preferences preferences;
 // State Variables
 String ssid = "";
 String password = "";
-String device_name = "Portal32-Device";
+String device_name = "Portal32";
 bool isAPMode = false;
+bool isConnecting = false;
+bool shouldConnect = false;
+unsigned long connectionStartTime = 0;
 unsigned long lastStatusCheck = 0;
 
 // --- HTML / CSS / JS UI ---
@@ -99,11 +102,47 @@ const char INDEX_HTML[] PROGMEM = R"=====(
         .success { background: #e8f5e9; color: #2e7d32; }
         .error { background: #ffebee; color: #c62828; }
         .scan-btn { font-size: 12px; color: var(--primary); cursor: pointer; float: right; }
+        .info-card { 
+            background: #f8f9fa; 
+            padding: 12px; 
+            border-radius: 10px; 
+            margin-bottom: 1.5rem; 
+            font-size: 14px;
+            border: 1px solid #e9ecef;
+        }
+        .info-row { display: flex; justify-content: space-between; margin-bottom: 5px; }
+        .info-label { color: var(--secondary); font-weight: 500; }
+        .badge { 
+            padding: 2px 8px; 
+            border-radius: 12px; 
+            font-size: 11px; 
+            font-weight: 700; 
+            text-transform: uppercase;
+        }
+        .badge-green { background: #e8f5e9; color: #2e7d32; }
+        .badge-gray { background: #f1f3f4; color: #5f6368; }
+        .badge-red { background: #ffebee; color: #c62828; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Portal32</h1>
+        
+        <div id="connection-info" class="info-card">
+            <div class="info-row">
+                <span class="info-label">Network:</span>
+                <span id="curr-ssid">--</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Connection:</span>
+                <span id="conn-status" class="badge">Checking...</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">Internet:</span>
+                <span id="net-status" class="badge">Checking...</span>
+            </div>
+        </div>
+
         <div class="form-group">
             <span class="scan-btn" onclick="scanWifi()">Refresh Scan</span>
             <label for="ssid">WiFi Network (SSID)</label>
@@ -181,7 +220,32 @@ const char INDEX_HTML[] PROGMEM = R"=====(
             }
         }
 
-        window.onload = scanWifi;
+        async function checkStatus() {
+            try {
+                const res = await fetch('/status');
+                const data = await res.json();
+                
+                document.getElementById('curr-ssid').textContent = data.current_ssid || "Not Connected";
+                
+                const conn = document.getElementById('conn-status');
+                conn.textContent = data.status;
+                conn.className = 'badge ' + (data.status === 'connected' ? 'badge-green' : 'badge-gray');
+
+                const net = document.getElementById('net-status');
+                net.textContent = data.internet ? 'Access' : 'No Access';
+                net.className = 'badge ' + (data.internet ? 'badge-green' : 'badge-red');
+
+                if (data.device) document.getElementById('name').value = data.device;
+            } catch (e) {
+                console.error("Status check failed", e);
+            }
+        }
+
+        window.onload = () => {
+            scanWifi();
+            checkStatus();
+            setInterval(checkStatus, 5000);
+        };
     </script>
 </body>
 </html>
@@ -189,7 +253,8 @@ const char INDEX_HTML[] PROGMEM = R"=====(
 
 // --- Function Prototypes ---
 void setupAP();
-void setupSTA();
+void startSTA();
+void initWebServer();
 void loadSettings();
 void saveSettings(String s, String p, String n);
 void handleRoot();
@@ -200,14 +265,22 @@ void handleNotFound();
 
 void setup() {
     Serial.begin(115200);
-    delay(100);
-    Serial.println("\n[SYSTEM] Portal32 Starting...");
+    delay(500); // Give serial time to stabilize
+    Serial.println("\n\n[SYSTEM] Portal32 Booting...");
 
     loadSettings();
 
+    // Set initial WiFi mode based on saved credentials
     if (ssid.length() > 0) {
-        Serial.printf("[WIFI] Attempting STA connection to: %s\n", ssid.c_str());
-        setupSTA();
+        WiFi.mode(WIFI_STA);
+    } else {
+        WiFi.mode(WIFI_AP_STA);
+    }
+
+    initWebServer();
+
+    if (ssid.length() > 0) {
+        startSTA();
     } else {
         Serial.println("[WIFI] No credentials found. Starting AP...");
         setupAP();
@@ -215,17 +288,43 @@ void setup() {
 }
 
 void loop() {
+    // Only process DNS if we are in AP mode and it was started
     if (isAPMode) {
         dnsServer.processNextRequest();
     }
+    
     server.handleClient();
     
-    // Check connection status periodically if not in AP mode
-    if (!isAPMode && WiFi.status() != WL_CONNECTED && millis() - lastStatusCheck > 30000) {
-        Serial.println("[WIFI] Connection lost. Re-evaluating...");
-        if (WiFi.status() == WL_CONNECT_FAILED || WiFi.status() == WL_NO_SSID_AVAIL) {
-            setupAP();
+    // Handle manual reconnection request
+    if (shouldConnect) {
+        shouldConnect = false;
+        startSTA();
+    }
+
+    // Connection state machine
+    if (isConnecting) {
+        if (WiFi.status() == WL_CONNECTED) {
+            isConnecting = false;
+            isAPMode = false;
+            Serial.println("\n[WIFI] Connected!");
+            Serial.print("[WIFI] IP Address: ");
+            Serial.println(WiFi.localIP());
+            
+            if (MDNS.begin(device_name.c_str())) {
+                Serial.println("[MDNS] Started: " + device_name + ".local");
+            }
+            // Optional: WiFi.mode(WIFI_STA); // Turn off AP once connected
+        } else if (millis() - connectionStartTime > 20000) {
+            isConnecting = false;
+            Serial.println("\n[WIFI] Connection failed (timeout).");
+            if (!isAPMode) setupAP();
         }
+    }
+    
+    // Check connection status periodically if in STA mode
+    if (!isAPMode && !isConnecting && WiFi.status() != WL_CONNECTED && millis() - lastStatusCheck > 30000) {
+        Serial.println("[WIFI] Connection lost. Re-attempting...");
+        startSTA();
         lastStatusCheck = millis();
     }
     
@@ -254,61 +353,49 @@ void saveSettings(String s, String p, String n) {
 
 void setupAP() {
     isAPMode = true;
-    WiFi.mode(WIFI_AP);
+    isConnecting = false;
+    
+    WiFi.mode(WIFI_AP_STA); // Mixed mode required for scanning while AP is active
     WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-    WiFi.softAP(AP_SSID);
+    
+    if (WiFi.softAP(AP_SSID)) {
+        Serial.print("[WIFI] AP Mode started. SSID: ");
+        Serial.println(AP_SSID);
+        Serial.print("[WIFI] IP Address: ");
+        Serial.println(WiFi.softAPIP());
 
-    Serial.print("[WIFI] AP Mode started. SSID: ");
-    Serial.println(AP_SSID);
-    Serial.print("[WIFI] IP Address: ");
-    Serial.println(WiFi.softAPIP());
+        // Start DNS Server for Captive Portal
+        dnsServer.start(DNS_PORT, "*", apIP);
+        Serial.println("[DNS] Captive Portal server started");
+    } else {
+        Serial.println("[WIFI] Failed to start SoftAP");
+    }
+}
 
-    // Start DNS Server for Captive Portal
-    dnsServer.start(DNS_PORT, "*", apIP);
-
-    // Setup Web Server Routes
+void initWebServer() {
     server.on("/", handleRoot);
     server.on("/scan", handleScan);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/status", handleStatus);
-    server.onNotFound(handleRoot); // Redirect anything else to root for captive portal
+    server.onNotFound(handleRoot); 
     server.begin();
-    
     Serial.println("[HTTP] Web Server started");
 }
 
-void setupSTA() {
-    isAPMode = false;
-    WiFi.mode(WIFI_STA);
+void startSTA() {
+    isConnecting = true;
+    connectionStartTime = millis();
+    
+    // Ensure we are in a mode that supports STA
+    if (isAPMode) {
+        WiFi.mode(WIFI_AP_STA);
+    } else {
+        WiFi.mode(WIFI_STA);
+    }
+    
     WiFi.setHostname(device_name.c_str());
     WiFi.begin(ssid.c_str(), password.c_str());
-
-    Serial.print("[WIFI] Connecting");
-    int timeout = 0;
-    while (WiFi.status() != WL_CONNECTED && timeout < 20) {
-        delay(500);
-        Serial.print(".");
-        timeout++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n[WIFI] Connected!");
-        Serial.print("[WIFI] IP Address: ");
-        Serial.println(WiFi.localIP());
-        
-        if (MDNS.begin(device_name.c_str())) {
-            Serial.println("[MDNS] Started: " + device_name + ".local");
-        }
-
-        server.on("/", handleRoot);
-        server.on("/status", handleStatus);
-        server.on("/scan", handleScan); // Allow re-scanning even in STA
-        server.begin();
-        Serial.println("[HTTP] Web Server started in STA mode");
-    } else {
-        Serial.println("\n[WIFI] Connection failed. Falling back to AP...");
-        setupAP();
-    }
+    Serial.printf("[WIFI] Connecting to %s...\n", ssid.c_str());
 }
 
 // --- Handlers ---
@@ -347,16 +434,30 @@ void handleSave() {
     Serial.println("[SYSTEM] New configuration received. Saving...");
     saveSettings(s, p, n);
 
+    // Update global variables
+    ssid = s;
+    password = p;
+    device_name = n;
+
     server.send(200, "application/json", "{\"status\":\"ok\"}");
     
-    delay(1000);
-    Serial.println("[SYSTEM] Rebooting...");
-    ESP.restart();
+    // Trigger reconnection in loop()
+    shouldConnect = true;
 }
 
 void handleStatus() {
+    bool internet = false;
+    if (WiFi.status() == WL_CONNECTED) {
+        // Use a more robust check if possible, or just check IP validity
+        if (WiFi.localIP()[0] != 0) {
+             internet = true; // Simple assumption for now to avoid DNS block
+        }
+    }
+
     String json = "{";
     json += "\"status\":\"" + String(WiFi.status() == WL_CONNECTED ? "connected" : "idle") + "\",";
+    json += "\"current_ssid\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "") + "\",";
+    json += "\"internet\":" + String(internet ? "true" : "false") + ",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"device\":\"" + device_name + "\"";
     json += "}";

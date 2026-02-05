@@ -30,3 +30,5 @@ Lightweight ESP32 configuration & provisioning portal with HTML, CSS, and JavaSc
 - ESP32 Board
 - Arduino IDE or PlatformIO
 - Libraries: `WiFi`, `WebServer`, `DNSServer`, `Preferences`, `ESPmDNS`
+
+LE:09252026
